@@ -7,12 +7,12 @@ from collections import OrderedDict
 
 import numpy as np
 import torch
-
 from flamo.optimize.dataset import DatasetColorless
 from flamo.optimize.trainer import Trainer
 from flamo.processor import dsp, system
 from flamo.optimize.loss import sparsity_loss, masked_mse_loss
 from flamo.functional import skew_matrix
+from flamo.utils import save_audio
 
 
 DEFAULT_SEED = 130709
@@ -98,7 +98,35 @@ def build_fdn(
     delays.assign_value(delays.sample2s(delay_lengths))
 
     metadata: dict = {}
-    if feedback_kind == "orthogonal":
+    if feedback_kind == "baseline":
+        feedback = dsp.Matrix(
+            size=(N, N),
+            nfft=args.nfft,
+            matrix_type="orthogonal",
+            requires_grad=False,
+            alias_decay_db=alias_decay_db,
+            device=args.device,
+            dtype=args.dtype,
+        )
+        with torch.no_grad():
+            feedback.param.data = torch.randn(
+                N, N, device=args.device, dtype=args.dtype
+            )
+    elif feedback_kind == "hadamard":
+        if (N & (N - 1)) != 0:
+            raise ValueError(
+                f"Hadamard baseline requires power-of-two N, got N={N}."
+            )
+        feedback = dsp.Matrix(
+            size=(N, N),
+            nfft=args.nfft,
+            matrix_type="hadamard",
+            requires_grad=False,
+            alias_decay_db=alias_decay_db,
+            device=args.device,
+            dtype=args.dtype,
+        )
+    elif feedback_kind == "orthogonal":
         feedback = dsp.Matrix(
             size=(N, N),
             nfft=args.nfft,
@@ -117,7 +145,17 @@ def build_fdn(
             device=args.device,
             dtype=args.dtype,
         )
-    elif feedback_kind in ("scattering", "scattering_hadamard"):
+    elif feedback_kind == "multi_householder":
+        feedback = dsp.MultiHouseholderMatrix(
+            size=(N, N),
+            num_reflections=args.num_reflections,
+            nfft=args.nfft,
+            requires_grad=True,
+            alias_decay_db=alias_decay_db,
+            device=args.device,
+            dtype=args.dtype,
+        )
+    elif feedback_kind in ("scattering", "scattering_hadamard", "scattering_householder"):
         min_delay = int(delay_lengths.min().item())
         high = max(2, int(np.floor(min_delay / 2)))
         m_L = torch.randint(
@@ -157,12 +195,27 @@ def build_fdn(
             fixed_h = hadamard_power2(N, device=args.device, dtype=args.dtype)
 
             def map_with_fixed(param: torch.Tensor) -> torch.Tensor:
-                U0 = torch.matrix_exp(skew_matrix(param[0]))
+                U_last = torch.matrix_exp(skew_matrix(param[-1]))
                 fixed = fixed_h.to(param.device, param.dtype)
-                U = [U0] + [fixed] * (param.shape[0] - 1)
+                U = [fixed] * (param.shape[0] - 1) + [U_last]
                 return torch.stack(U, dim=0)
 
             feedback.map = map_with_fixed
+        elif feedback_kind == "scattering_householder":
+
+            def map_householder(param: torch.Tensor) -> torch.Tensor:
+                # param shape: (K, N, N); build K Householder matrices of size N x N
+                # Use first column of each stage as Householder vector.
+                u = param[..., 0]  # shape (K, N)
+                norm = torch.norm(u, dim=-1, keepdim=True)
+                norm = torch.clamp(norm, min=torch.finfo(param.dtype).eps)
+                u_unit = u / norm
+                eye = torch.eye(
+                    param.shape[-1], device=param.device, dtype=param.dtype
+                ).unsqueeze(0)
+                return eye - 2.0 * u_unit.unsqueeze(-1) * u_unit.unsqueeze(-2)
+
+            feedback.map = map_householder
     else:
         raise ValueError(f"Unsupported feedback kind: {feedback_kind}")
 
@@ -218,14 +271,33 @@ def collect_params(model: system.Shell) -> dict:
 
 
 def save_config(path: str, config: dict) -> None:
+    def _no_complex(obj):
+        """Recursively convert for JSON: complex with imag=0 -> real, else [real, imag]."""
+        if isinstance(obj, (list, tuple)):
+            return [_no_complex(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _no_complex(v) for k, v in obj.items()}
+        if isinstance(obj, (complex, np.complexfloating)):
+            r, i = float(obj.real), float(obj.imag)
+            if abs(i) < 1e-15:
+                return r
+            return [r, i]
+        return obj
+
     def to_jsonable(value):
         if isinstance(value, torch.Tensor):
-            return value.detach().cpu().tolist()
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, (np.integer, np.floating)):
+            value = value.detach().cpu().tolist()
+        elif isinstance(value, np.ndarray):
+            value = value.tolist()
+        elif isinstance(value, (np.integer, np.floating)):
             return value.item()
-        return value
+        elif isinstance(value, (torch.dtype, np.dtype)):
+            return str(value)
+        elif isinstance(value, torch.device):
+            return str(value)
+        else:
+            return _no_complex(value)
+        return _no_complex(value)
 
     config = {k: to_jsonable(v) for k, v in config.items()}
     with open(path, "w") as f:
@@ -261,6 +333,8 @@ def run_training(
         model,
         max_epochs=args.max_epochs,
         lr=args.lr,
+        patience=args.patience,
+        patience_delta=args.patience_delta,
         train_dir=run_dir,
         device=args.device,
         log=False,
@@ -281,18 +355,44 @@ def run_training(
     trainer.train(train_loader, valid_loader)
     train_time = time.time() - start_time
 
+    # Save optimized impulse response as audio for inference inspection
+    with torch.no_grad():
+        ir_optim = model.get_time_response(
+            identity=False, fs=args.samplerate
+        ).squeeze()
+        peak = torch.max(torch.abs(ir_optim))
+        if peak > 0:
+            ir_optim = ir_optim / peak
+        ir_path = os.path.join(run_dir, "ir_optim.wav")
+        save_audio(ir_path, ir_optim, fs=args.samplerate)
+        print(f"  Saved {ir_path}")
+
     params = collect_params(model)
-    np.savez(os.path.join(run_dir, "params.npz"), **params)
-    torch.save(model.state_dict(), os.path.join(run_dir, "model_state.pt"))
+    params_npz_path = os.path.join(run_dir, "params.npz")
+    np.savez(params_npz_path, **params)
+    print(f"  Saved {params_npz_path}")
+
+    # Also store parameters as JSON for easier inspection
+    params_json_path = os.path.join(run_dir, "params.json")
+    save_config(params_json_path, params)
+    print(f"  Saved {params_json_path}")
+
+    model_path = os.path.join(run_dir, "model_state.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"  Saved {model_path}")
 
     loss_log = {
         "train_loss": trainer.train_loss,
         "valid_loss": trainer.valid_loss,
         "train_time_sec": train_time,
     }
-    save_config(os.path.join(run_dir, "loss.json"), loss_log)
+    loss_path = os.path.join(run_dir, "loss.json")
+    save_config(loss_path, loss_log)
+    print(f"  Saved {loss_path} (train_time_sec={train_time:.1f})")
 
-    save_config(os.path.join(run_dir, "config.json"), extra_config)
+    config_path = os.path.join(run_dir, "config.json")
+    save_config(config_path, extra_config)
+    print(f"  Saved {config_path}")
 
 
 def load_dataset_seeded(
@@ -305,7 +405,8 @@ def load_dataset_seeded(
 ):
     train_set_size = int(len(dataset) * split)
     valid_set_size = len(dataset) - train_set_size
-    generator = torch.Generator(device=device)
+    # random_split requires a CPU generator (only used for indexing)
+    generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     train_set, valid_set = torch.utils.data.random_split(
         dataset, [train_set_size, valid_set_size], generator=generator
@@ -325,6 +426,8 @@ def main(args: argparse.Namespace) -> None:
         args.device = "cpu"
         print("cuda not available, will use cpu")
 
+    print(f"Using device: {args.device}")
+
     # convert dtype string to torch dtype
     args.dtype = torch.float32 if args.dtype == "float32" else torch.float64
 
@@ -336,88 +439,96 @@ def main(args: argparse.Namespace) -> None:
         )
     os.makedirs(args.train_dir, exist_ok=True)
 
+    print(f"Train output directory: {args.train_dir}")
     root_args = {k: v for k, v in vars(args).items()}
-    save_config(os.path.join(args.train_dir, "args.json"), root_args)
+    args_path = os.path.join(args.train_dir, "args.json")
+    save_config(args_path, root_args)
+    print(f"  Saved {args_path}")
 
-    orthogonal_N = [8, 16, 64]
-    scattering_N = [4, 6, 8]
-    scattering_hadamard_N = [4, 8]
-
+    # 6 configs × 2 sizes each; 4 FDNs per (config, size)
     worklist = [
-        ("orthogonal", orthogonal_N),
-        ("householder", orthogonal_N),
-        ("scattering", scattering_N),
-        ("scattering_hadamard", scattering_hadamard_N),
+        ("baseline", [8, 16, 32]),                    # 1: baseline, train I/O only
+        ("hadamard", [8, 16, 32]),                    # 2: hadamard, train I/O only
+        ("orthogonal", [8, 16, 32]),                  # 3: trained orthogonal
+        ("householder", [8, 16, 32]),                 # 4: trained single Householder
+        ("multi_householder", [8, 16, 32]),           # 5: trained multi-reflection Householder
+        # ("scattering", [6]),                        # 6: scattering, each mix trained orthogonal
+        # ("scattering_hadamard", [4, 8]),            # 7: scattering, last mix trained orthogonal, rest Hadamard
+        # ("scattering_householder", [4, 6, 8]),      # 8: scattering, each mix trained Householder
     ]
 
     unique_sizes = sorted({n for _, n_list in worklist for n in n_list})
     delays_by_size: dict[int, list[torch.Tensor]] = {}
     for N in unique_sizes:
-        if N == 64:
-            delay_low = args.delay_min_64
-            delay_high = args.delay_max_64
-        else:
-            delay_low = args.delay_min
-            delay_high = args.delay_max
         delays_by_size[N] = [
-            sample_coprime_delays(N, delay_low, delay_high)
+            sample_coprime_delays(N, args.delay_min, args.delay_max)
             for _ in range(args.sets_per_config)
         ]
 
     for feedback_kind, n_list in worklist:
         for N in n_list:
-            if N == 64:
-                delay_low = args.delay_min_64
-                delay_high = args.delay_max_64
-            else:
-                delay_low = args.delay_min
-                delay_high = args.delay_max
+            delay_low = args.delay_min
+            delay_high = args.delay_max
 
-            for set_idx in range(args.sets_per_config):
-                delay_lengths = delays_by_size[N][set_idx]
-                model, metadata = build_fdn(args, N, delay_lengths, feedback_kind)
-
-                run_dir = os.path.join(
-                    args.train_dir,
-                    feedback_kind,
-                    f"N{N}",
-                    f"set_{set_idx:02d}",
-                )
+            for delay_idx in range(args.sets_per_config):
+                delay_lengths = delays_by_size[N][delay_idx]
+                delay_list = delay_lengths.tolist()
 
                 dataset_expand = (
                     args.num_scattering
-                    if feedback_kind in ("scattering", "scattering_hadamard")
+                    if feedback_kind
+                    in ("scattering", "scattering_hadamard", "scattering_householder")
                     else args.num
                 )
                 if dataset_expand is None:
                     dataset_expand = max(1, (args.nfft // 2 + 1) // 2000)
 
-                config = {
-                    "feedback_kind": feedback_kind,
-                    "N": N,
-                    "set_index": set_idx,
-                    "delay_lengths_samples": delay_lengths,
-                    "delay_range": [delay_low, delay_high],
-                    "samplerate": args.samplerate,
-                    "nfft": args.nfft,
-                    "max_epochs": args.max_epochs,
-                    "lr": args.lr,
-                    "batch_size": args.batch_size,
-                    "dataset_expand": dataset_expand,
-                    "mask_samples": args.mask_samples,
-                    "sparsity_weight": args.sparsity_weight,
-                    "alias_decay_db": args.alias_decay_db,
-                    "seed": args.seed,
-                    **metadata,
-                }
+                for init_idx in range(args.inits_per_delay):
+                    model, metadata = build_fdn(args, N, delay_lengths, feedback_kind)
 
-                run_training(args, run_dir, model, dataset_expand, config)
+                    run_dir = os.path.join(
+                        args.train_dir,
+                        feedback_kind,
+                        f"N{N}",
+                        f"set_{delay_idx:02d}_{init_idx:02d}",
+                    )
+                    print(
+                        f"\nTraining job: type={feedback_kind}, N={N}, "
+                        f"delay_set={delay_idx}, init={init_idx}"
+                    )
+                    print(f"  delay_lengths (samples): {delay_list}")
+                    print(f"  -> {run_dir}")
+
+                    config = {
+                        "feedback_kind": feedback_kind,
+                        "N": N,
+                        "delay_index": delay_idx,
+                        "init_index": init_idx,
+                        "delay_lengths_samples": delay_lengths,
+                        "delay_range": [delay_low, delay_high],
+                        "samplerate": args.samplerate,
+                        "nfft": args.nfft,
+                        "max_epochs": args.max_epochs,
+                        "patience": args.patience,
+                        "patience_delta": args.patience_delta,
+                        "lr": args.lr,
+                        "batch_size": args.batch_size,
+                        "dataset_expand": dataset_expand,
+                        "mask_samples": args.mask_samples,
+                        "sparsity_weight": args.sparsity_weight,
+                        "alias_decay_db": args.alias_decay_db,
+                        "num_reflections": args.num_reflections,
+                        "seed": args.seed,
+                        **metadata,
+                    }
+
+                    run_training(args, run_dir, model, dataset_expand, config)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--nfft", type=int, default=48000 * 4, help="FFT size")
+    parser.add_argument("--nfft", type=int, default=2**17, help="FFT size")
     parser.add_argument("--samplerate", type=int, default=48000, help="sampling rate")
     parser.add_argument(
         "--dtype",
@@ -441,6 +552,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_epochs", type=int, default=1000, help="maximum number of epochs"
     )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=5,
+        help="early stopping patience in epochs",
+    )
+    parser.add_argument(
+        "--patience_delta",
+        type=float,
+        default=0.001,
+        help="minimum validation loss improvement to count as improvement",
+    )
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
     parser.add_argument(
         "--train_dir", type=str, help="directory to save training results"
@@ -449,7 +572,19 @@ if __name__ == "__main__":
         "--sets_per_config",
         type=int,
         default=4,
-        help="number of random sets per configuration",
+        help="number of random delay sets per configuration",
+    )
+    parser.add_argument(
+        "--inits_per_delay",
+        type=int,
+        default=4,
+        help="number of independently-initialized FDN training runs per delay set",
+    )
+    parser.add_argument(
+        "--num_reflections",
+        type=int,
+        default=None,
+        help="number of Householder reflections for multi_householder (defaults to N)",
     )
     parser.add_argument(
         "--delay_min",
@@ -460,25 +595,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--delay_max",
         type=int,
-        default=2500,
+        default=3000,
         help="maximum delay length (samples) for standard runs",
     )
-    parser.add_argument(
-        "--delay_min_64",
-        type=int,
-        default=500,
-        help="minimum delay length (samples) for N=64 runs",
-    )
-    parser.add_argument(
-        "--delay_max_64",
-        type=int,
-        default=5000,
-        help="maximum delay length (samples) for N=64 runs",
-    )
+
     parser.add_argument(
         "--mask_samples",
         type=int,
-        default=12000,
+        default=2048,
         help="number of bins used for masked MSE loss",
     )
     parser.add_argument(

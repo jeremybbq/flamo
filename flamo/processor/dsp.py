@@ -662,7 +662,14 @@ class HouseholderMatrix(Gain):
     ):
         assert size[0] == size[1], "Matrix must be square"
         size = (size[0], 1)
-        map = lambda x: to_complex(x) / torch.norm(x, dim=0, keepdim=True)
+
+        # Normalize Householder vector safely to avoid division-by-zero / NaNs
+        def _unit_vector(x: torch.Tensor) -> torch.Tensor:
+            norm = torch.norm(x, dim=0, keepdim=True)
+            norm = torch.clamp(norm, min=torch.finfo(x.dtype).eps)
+            return to_complex(x) / norm
+
+        map = _unit_vector
         super().__init__(
             size=size,
             nfft=nfft,
@@ -712,6 +719,114 @@ class HouseholderMatrix(Gain):
                 **x** (torch.Tensor): Input tensor of shape :math:`(B, M, N_{in}, ...)`.
         """
         if (self.size[0]) != (x.shape[2]):
+            raise ValueError(
+                f"parameter shape = {self.size} not compatible with input signal of shape = ({x.shape})."
+            )
+
+    def get_io(self):
+        r"""
+        Computes the number of input and output channels based on the size parameter.
+        """
+        self.input_channels = self.size[0]
+        self.output_channels = self.size[0]
+
+
+class MultiHouseholderMatrix(Gain):
+    r"""
+    A class representing a product of K Householder reflections.
+
+    The matrix is computed as:
+
+    .. math::
+
+        \mathbf{U} = \mathbf{H}_K \cdots \mathbf{H}_2 \mathbf{H}_1, \quad
+        \mathbf{H}_k = \mathbf{I} - 2 u_k u_k^\top
+
+    where each :math:`u_k` is a unit vector. When :math:`K \geq N` the construction
+    can represent any orthogonal matrix.
+
+    The forward pass applies each reflection sequentially without forming the
+    explicit :math:`N \times N` matrix, keeping memory cost at :math:`O(NK)`.
+
+        **Arguments**:
+            - **size** (tuple): Size of the square matrix ``(N, N)``. Defaults to (1, 1).
+            - **num_reflections** (int, optional): Number of Householder reflections K.
+              Defaults to N (full expressivity).
+            - **nfft** (int): Number of FFT points. Defaults to 2**11.
+            - **requires_grad** (bool): If True, gradients will be computed. Defaults to False.
+            - **alias_decay_db** (float): Alias decay in dB. Defaults to 0.0.
+            - **device** (optional): Computation device. Defaults to None.
+            - **dtype** (torch.dtype): Data type for tensors. Defaults to torch.float32.
+
+        **Attributes**:
+            - **param** (nn.Parameter): Raw parameter matrix of shape ``(N, K)``.
+            - **num_reflections** (int): Number of reflections K.
+    """
+
+    def __init__(
+        self,
+        size: tuple = (1, 1),
+        num_reflections: int = None,
+        nfft: int = 2**11,
+        requires_grad: bool = False,
+        alias_decay_db: float = 0.0,
+        device: Optional[str] = None,
+        dtype: torch.dtype = torch.float32,
+    ):
+        assert size[0] == size[1], "Matrix must be square"
+        N = size[0]
+        self.num_reflections = N if num_reflections is None else num_reflections
+
+        def _unit_columns(x: torch.Tensor) -> torch.Tensor:
+            norm = torch.norm(x, dim=0, keepdim=True)
+            norm = torch.clamp(norm, min=torch.finfo(x.dtype).eps)
+            return to_complex(x / norm)
+
+        super().__init__(
+            size=(N, self.num_reflections),
+            nfft=nfft,
+            map=_unit_columns,
+            requires_grad=requires_grad,
+            alias_decay_db=alias_decay_db,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, x, ext_param=None):
+        r"""
+        Applies K successive Householder reflections to input x.
+
+        Each reflection :math:`\mathbf{H}_k = \mathbf{I} - 2 u_k u_k^\top` is applied
+        in sequence without forming the explicit :math:`N \times N` matrix.
+
+        **Arguments**:
+            - **x** (torch.Tensor): Input tensor of shape :math:`(B, M, N, ...)`.
+            - **ext_param** (torch.Tensor, optional): External parameter of shape ``(N, K)``. Default: None.
+        **Returns**:
+            torch.Tensor: Output tensor of shape :math:`(B, M, N, ...)`.
+        """
+        self.check_input_shape(x)
+        if ext_param is None:
+            U = self.map(self.param)
+        else:
+            with torch.no_grad():
+                self.assign_value(ext_param)
+            U = self.map(ext_param)
+
+        for k in range(self.num_reflections):
+            u = U[:, k : k + 1]  # (N, 1)
+            uTx = torch.einsum("mn,bfn...->bfm...", u.transpose(1, 0), x)
+            x = x - 2 * torch.einsum("nm,bfm...->bfn...", u, uTx)
+        return x
+
+    def check_input_shape(self, x):
+        r"""
+        Checks if the input tensor dimensions are compatible.
+
+            **Arguments**:
+                **x** (torch.Tensor): Input tensor of shape :math:`(B, M, N, ...)`.
+        """
+        if self.size[0] != x.shape[2]:
             raise ValueError(
                 f"parameter shape = {self.size} not compatible with input signal of shape = ({x.shape})."
             )

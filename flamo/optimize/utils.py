@@ -25,10 +25,10 @@ def generate_partitions(
     n_partitions = length // n_samples
 
     # Ensure the tensor length is divisible by N
-    if length % n_samples != 0:
-        print(
-            "Warning: Tensor length is divisible by n_samples so there will be some samples left out."
-        )
+    # if length % n_samples != 0:
+    #     print(
+    #         "Warning: Tensor length is divisible by n_samples so there will be some samples left out."
+    #     )
 
     partitions_sets = []
     for _ in range(n_sets):

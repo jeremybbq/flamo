@@ -2,10 +2,7 @@ import torch
 import argparse
 import os
 import time
-import numpy as np
 import scipy
-import scipy.signal
-import matplotlib.pyplot as plt
 
 from collections import OrderedDict
 
@@ -15,24 +12,23 @@ from flamo.processor import dsp, system
 from flamo.optimize.loss import sparsity_loss, masked_mse_loss
 from flamo.utils import save_audio
 
-torch.manual_seed(3)
+torch.manual_seed(130709)
 
 
 def example_fdn(args):
     """
-    Example function that demonstrates the construction and training of a Feedback Delay Network (FDN) model
-    with scattering feedback matrix and sparse marsking of the loss.
+    Example function that demonstrates the construction and training of a
+    Feedback Delay Network (FDN) model where the feedback path is implemented
+    with a learnable Householder matrix instead of an orthogonal matrix.
+
     Args:
-        args: A dictionary or object containing the necessary arguments for the function.
-    Returns:
-        None
+        args: A namespace containing the necessary arguments for the function.
     """
 
     # FDN parameters
     N = 6  # number of delays
     alias_decay_db = 30  # alias decay in dB
-    delay_lengths = torch.tensor([997, 1153, 1327, 1559, 1801, 2099])
-    args.num = (args.nfft // 2 + 1) // 2000
+    delay_lengths = torch.tensor([887, 911, 941, 1699, 1951, 2053])
 
     ## ---------------- CONSTRUCT FDN ---------------- ##
 
@@ -66,30 +62,12 @@ def example_fdn(args):
     )
     delays.assign_value(delays.sample2s(delay_lengths))
 
-    # Feedback path with scattering matrix
-    m_L = torch.randint(
-        low=1,
-        high=int(torch.floor(min(delay_lengths) / 2)),
-        size=[N],
-        device=args.device,
-        dtype=args.dtype,
-    )
-    m_R = torch.randint(
-        low=1,
-        high=int(torch.floor(min(delay_lengths) / 2)),
-        size=[N],
-        device=args.device,
-        dtype=args.dtype,
-    )
-    feedback = dsp.ScatteringMatrix(
-        size=(4, N, N),
+    # Feedback path with Householder matrix
+    feedback = dsp.HouseholderMatrix(
+        size=(N, N),
         nfft=args.nfft,
-        gain_per_sample=1,
-        sparsity=3,
-        m_L=m_L,
-        m_R=m_R,
-        alias_decay_db=alias_decay_db,
         requires_grad=True,
+        alias_decay_db=alias_decay_db,
         device=args.device,
         dtype=args.dtype,
     )
@@ -121,7 +99,7 @@ def example_fdn(args):
             ir_init / torch.max(torch.abs(ir_init)),
             fs=args.samplerate,
         )
-        save_fdn_params(model, filename="parameters_init")
+        save_fdn_params(model, args=args, filename="parameters_init")
 
     ## ---------------- OPTIMIZATION SET UP ---------------- ##
 
@@ -167,95 +145,19 @@ def example_fdn(args):
             ir_optim / torch.max(torch.abs(ir_optim)),
             fs=args.samplerate,
         )
-        save_fdn_params(model, filename="parameters_optim")
-
-    # Frequency response magnitude and spectrogram figures (init vs optim)
-    fs = args.samplerate
-    ir_init_np = ir_init.squeeze().cpu().numpy()
-    ir_optim_np = ir_optim.squeeze().cpu().numpy()
-
-    # Magnitude response (dB) vs frequency
-    n_init = len(ir_init_np)
-    n_optim = len(ir_optim_np)
-    freq_init = np.fft.rfftfreq(n_init, 1.0 / fs)
-    freq_optim = np.fft.rfftfreq(n_optim, 1.0 / fs)
-    mag_init = np.abs(np.fft.rfft(ir_init_np))
-    mag_optim = np.abs(np.fft.rfft(ir_optim_np))
-    eps = 1e-12
-    mag_init_db = 20 * np.log10(mag_init + eps)
-    mag_optim_db = 20 * np.log10(mag_optim + eps)
-
-    # Smoothed curves (moving average with edge padding)
-    win = max(31, len(mag_init_db) // 100)
-    win = win + 1 if win % 2 == 0 else win
-    mag_init_smooth = np.convolve(
-        np.pad(mag_init_db, (win // 2, win // 2), mode="edge"),
-        np.ones(win) / win,
-        mode="valid",
-    )
-    win_opt = max(31, len(mag_optim_db) // 100)
-    win_opt = win_opt + 1 if win_opt % 2 == 0 else win_opt
-    mag_optim_smooth = np.convolve(
-        np.pad(mag_optim_db, (win_opt // 2, win_opt // 2), mode="edge"),
-        np.ones(win_opt) / win_opt,
-        mode="valid",
-    )
-
-    fig_mag, ax_mag = plt.subplots(figsize=(8, 4))
-    ax_mag.plot(freq_init, mag_init_db, label="Init", alpha=0.8)
-    ax_mag.plot(freq_init, mag_init_smooth, "--", color=ax_mag.lines[-1].get_color(), alpha=0.9)
-    ax_mag.plot(freq_optim, mag_optim_db, label="Optim", alpha=0.8)
-    ax_mag.plot(freq_optim, mag_optim_smooth, "--", color=ax_mag.lines[-1].get_color(), alpha=0.9)
-    ax_mag.set_xlabel("Frequency (Hz)")
-    ax_mag.set_ylabel("Magnitude (dB)")
-    ax_mag.set_xscale("log")
-    ax_mag.set_xlim([20, fs / 2])
-    ax_mag.legend()
-    ax_mag.grid(True, alpha=0.3)
-    fig_mag.tight_layout()
-    fig_mag.savefig(os.path.join(args.train_dir, "frequency_response_magnitude.png"), dpi=150)
-    plt.close(fig_mag)
-
-    # Spectrograms (init and optim in two subplots)
-    nperseg = min(2048, n_init // 4, n_optim // 4)
-    f_init, t_init, Sxx_init = scipy.signal.spectrogram(ir_init_np, fs=fs, nperseg=nperseg)
-    f_optim, t_optim, Sxx_optim = scipy.signal.spectrogram(ir_optim_np, fs=fs, nperseg=nperseg)
-    Sxx_init_db = 10 * np.log10(Sxx_init + eps)
-    Sxx_optim_db = 10 * np.log10(Sxx_optim + eps)
-    # Normalize color range to data (avoid mostly black spectrograms)
-    all_db = np.concatenate([Sxx_init_db.ravel(), Sxx_optim_db.ravel()])
-    vmin = np.percentile(all_db, 2)
-    vmax = np.percentile(all_db, 98)
-
-    fig_spec, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
-    im1 = ax1.pcolormesh(
-        t_init, f_init, Sxx_init_db, cmap="magma", vmin=vmin, vmax=vmax, shading="auto"
-    )
-    ax1.set_ylabel("Frequency (Hz)")
-    ax1.set_yscale("log")
-    ax1.set_ylim([20, fs / 2])
-    ax1.set_title("Init")
-    im2 = ax2.pcolormesh(
-        t_optim, f_optim, Sxx_optim_db, cmap="magma", vmin=vmin, vmax=vmax, shading="auto"
-    )
-    ax2.set_ylabel("Frequency (Hz)")
-    ax2.set_xlabel("Time (s)")
-    ax2.set_yscale("log")
-    ax2.set_ylim([20, fs / 2])
-    ax2.set_title("Optim")
-    fig_spec.colorbar(im2, ax=[ax1, ax2], label="Magnitude (dB)", shrink=0.6)
-    fig_spec.tight_layout()
-    fig_spec.savefig(os.path.join(args.train_dir, "spectrogram.png"), dpi=150)
-    plt.close(fig_spec)
+        save_fdn_params(model, args=args, filename="parameters_optim")
 
 
-def save_fdn_params(net, filename="parameters"):
+def save_fdn_params(net, args, filename="parameters"):
     r"""
-    Retrieves the parameters of a feedback delay network (FDN) from a given network and saves them in .mat format.
+    Retrieves the parameters of a feedback delay network (FDN) from a given
+    network and saves them in .mat format.
 
     **Parameters**:
         net (Shell): The Shell class containing the FDN.
-        filename (str): The name of the file to save the parameters without file extension.
+        args (argparse.Namespace): Parsed CLI arguments (for `train_dir`).
+        filename (str): The name of the file to save the parameters without
+            file extension.
     **Returns**:
         dict: A dictionary containing the FDN parameters.
             - 'A' (ndarray): The feedback loop parameter A.
@@ -290,7 +192,14 @@ if __name__ == "__main__":
 
     parser.add_argument("--nfft", type=int, default=48000 * 4, help="FFT size")
     parser.add_argument("--samplerate", type=int, default=48000, help="sampling rate")
-    parser.add_argument("--dtype", type=str, default="float64", choices=["float32", "float64"], help="data type for tensors")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float64",
+        choices=["float32", "float64"],
+        help="data type for tensors",
+    )
+    parser.add_argument("--num", type=int, default=2**8, help="dataset size")
     parser.add_argument(
         "--device", type=str, default="cuda", help="device to use for computation"
     )
@@ -304,19 +213,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_dir", type=str, help="directory to save training results"
     )
-    parser.add_argument("--masked_loss", action="store_true", help="use masked loss")
 
     args = parser.parse_args()
 
     # check for compatible device
     if args.device == "cuda" and not torch.cuda.is_available():
-        print("cuda not available, will use cpu")
         args.device = "cpu"
-    else:
-        print(f"using device: {args.device}")
 
     # convert dtype string to torch dtype
     args.dtype = torch.float32 if args.dtype == "float32" else torch.float64
+    print("cuda not available, will use cpu")
 
     # make output directory
     if args.train_dir is not None:
@@ -338,3 +244,4 @@ if __name__ == "__main__":
         )
 
     example_fdn(args)
+

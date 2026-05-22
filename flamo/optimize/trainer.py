@@ -4,6 +4,7 @@ import time
 import torch.nn as nn
 from typing import Optional
 from tqdm import trange
+import json
 
 
 class Trainer:
@@ -122,7 +123,8 @@ class Trainer:
             self.valid_loss_log[loss_name] = []
 
         st = time.time()  # start time
-        for epoch in trange(self.max_epochs, desc="Training"):
+        pbar = trange(self.max_epochs, desc="Training")
+        for epoch in pbar:
             st_epoch = time.time()
 
             # training
@@ -138,19 +140,25 @@ class Trainer:
             self.valid_loss.append(epoch_loss / len(valid_dataset))
             et_epoch = time.time()
 
-            # print results
-            et_epoch = time.time()
-            self.print_results(epoch, et_epoch - st_epoch)
+            # update progress bar in place (no newlines)
+            pbar.set_postfix_str(
+                get_str_results(
+                    epoch=epoch,
+                    train_loss=self.train_loss,
+                    valid_loss=self.valid_loss,
+                    time=et_epoch - st_epoch,
+                )
+            )
 
             # save checkpoints
             if self.log:
                 self.save_model(epoch)
             if self.early_stop():
-                print("Early stopping at epoch: {}".format(epoch))
                 break
 
         et = time.time()  # end time
-        print("Training time: {:.3f}s".format(et - st))
+        print(f"Early stopping at epoch: {epoch}")
+        print(f"Training time: {et - st:.3f}s")
 
     def move_to_device(self, data: list | torch.Tensor):
         if isinstance(data, list):

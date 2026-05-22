@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from flamo.optimize.utils import generate_partitions
-from flamo.processor.dsp import HouseholderMatrix
+from flamo.processor.dsp import HouseholderMatrix, MultiHouseholderMatrix
 from nnAudio import features
 import pyfar as pf
 import torch.nn.functional as F
@@ -49,8 +49,15 @@ class sparsity_loss(nn.Module):
                 A = mixing_matrix.map(mixing_matrix.param)
 
         if isinstance(mixing_matrix, HouseholderMatrix):
-            u = A 
+            u = A
             A = torch.eye(u.shape[0], device=u.device, dtype=u.dtype) - 2 * u @ u.T
+        elif isinstance(mixing_matrix, MultiHouseholderMatrix):
+            U = A  # (N, K) complex unit vectors
+            N = U.shape[0]
+            A = torch.eye(N, device=U.device, dtype=U.dtype)
+            for k in range(U.shape[1]):
+                u_k = U[:, k : k + 1]  # (N, 1)
+                A = A - 2 * u_k @ (u_k.transpose(1, 0) @ A)
             
         N = A.shape[-1]
         if len(A.shape) == 3:
